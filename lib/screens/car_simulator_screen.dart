@@ -1,6 +1,5 @@
 /*
  * שם המסך: CarSimulatorScreen – מערכת הרכבים של IPI SMART PARKING
- * מה המסך עושה?
  * מציג את כל הכניסות והיציאות של הרכבים שנשמרו ב-Supabase.
  * אפשר לבחור תאריך, לחפש רכב או חניון, לראות מצב תשלום ופרטי ביקור.
  * אפשר לפתוח היסטוריית חניונים של רכב ולראות כמה פעמים נכנס.
@@ -64,7 +63,7 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
     super.initState();
     loadAll();
     refreshTimer = Timer.periodic(
-      const Duration(seconds: 5),
+      const Duration(seconds: 60),
       (_) async {
         await loadParkingLots();
         await loadSessions(silent: true);
@@ -203,6 +202,23 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
     );
     return baseDay.add(Duration(hours: hour, minutes: minute));
   }
+  // true רק אם המנהל סימן פטור לסוג הנכה המסוים בחניון.
+  // קורא את ipi_features, אותו שדה שטופס המנהל מעדכן ב-Supabase.
+  bool disabledExemptForLot(Map<String, dynamic> lot, String rawType) {
+    final type = rawType.toLowerCase().trim();
+    final kind = (type == 'disabled_regular')
+        ? 'disabled_regular'
+        : (type == 'disabled_wheelchair' || type == 'wheelchair')
+            ? 'disabled_wheelchair'
+            : null;
+    if (kind == null) return false; // תו נכה ישן לא מקבל פטור לא מוכח.
+    final raw = lot['ipi_features'];
+    if (raw is List) return raw.map((e) => e.toString()).contains(kind);
+    // תאימות לעמודות ישנות, רק כאשר אין מערך מאפיינים.
+    final legacy = lot[kind];
+    return legacy == true || legacy?.toString().toLowerCase() == 'true';
+  }
+
   /// מכינה את כל פרטי ביקור של רכב: כניסה, יציאה, מחיר, שם וסטטוס תשלום. אפשר לשנות כאן את הסיכויים, אבל לא את שמות השדות בלי התאמה ל-Supabase.
   Map<String, dynamic> buildSessionRow({
     required String plate,
@@ -213,6 +229,7 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
     int? durationMinutes,
     bool? stillParking,
     bool isVerifiedStudent = false, // רק אם מספר הרכב אומת בטבלת student_vehicles.
+    String vehicleType = 'regular', // רגיל, נכה רגיל, נכה כיסא גלגלים או מנוי.
   }) {
     final effectiveDuration = durationMinutes ?? randomDurationMinutes(random);
     final isStillParking = stillParking ?? (random.nextInt(100) < 16);
@@ -222,7 +239,16 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
     final pricePerMinute = asDouble(parking['price_per_minute']);
     // הסכום המקסימלי ליום שנשמר עבור הביקור.
     final dailyMax = asDouble(parking['daily_max']);
-    final isStudentRate = isVerifiedStudent && asDouble(parking['student_daily_price']) > 0;
+    final type = vehicleType.toLowerCase().trim();
+    final isDisabled = ['disabled', 'disabled_regular', 'disabled_wheelchair',
+      'wheelchair'].contains(type);
+    // בודק פטור לפי הסוג המדויק ולפי סימוני המנהל בחניון.
+    // disabled_regular וסוג כיסא גלגלים יכולים לקבל פטורים שונים.
+    // שדה הפטור הישן disabled_exit_allowed כבר לא קובע פטור לשניהם יחד.
+    final disabledFree = isDisabled && disabledExemptForLot(parking, type);
+    final isSubscriber = type == 'subscriber' || type == 'subscription';
+    final isStudentRate = !isDisabled && !isSubscriber && isVerifiedStudent &&
+        asDouble(parking['student_daily_price']) > 0;
     final rateForVisit = pricePerMinute <= 0
         ? _dayRate(parking, entryTime, student: isStudentRate)
         : dailyMax;
@@ -230,7 +256,7 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
       parking['grace_minutes'] ?? parking['GRACE_MINUTES'],
     );
     // סכום החניה שנשמר בביקור הזה.
-    final totalPrice = isStillParking
+    final totalPrice = (isStillParking || disabledFree || isSubscriber)
         ? 0.0
         : calcPrice(
             minutes: effectiveDuration,
@@ -250,6 +276,8 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
     if (!isStillParking) {
       if (totalPrice <= 0) {
         paymentStatus = 'not_required';
+        if (disabledFree) paymentMethod = 'disabled_permit';
+        if (isSubscriber) paymentMethod = 'subscription';
       } else {
         paymentStatus = 'paid';
         // שלושה מסלולי סיום תקינים בסימולציה.
@@ -260,7 +288,7 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
       }
     }
     return {
-      'plate': plate,
+      'plate': formatPlateForDb(plate),
       'parking_lot_id': parkingLotId(parking) == 0 ? null : parkingLotId(parking),
       'parking_name': parkingName(parking),
       'entry_time': entryTime.toUtc().toIso8601String(),
@@ -269,7 +297,7 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
       'payment_status': paymentStatus,
       'customer_name': customer.trim().isEmpty ? null : customer.trim(),
       'vehicle_source': customer.trim().isEmpty ? 'random' : 'named',
-      'vehicle_type': 'regular',
+      'vehicle_type': vehicleType,
       'is_student': isStudentRate,
       'price_per_minute': pricePerMinute,
       'daily_max': rateForVisit,
@@ -408,7 +436,7 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
     await showDialog<void>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: Text('היסטוריית חניונים • $plate'),
+        title: Text('היסטוריית חניונים • ${formatPlateForDb(plate)}'),
         content: SizedBox(
           width: 600,
           height: 420,
@@ -617,8 +645,13 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
   /// מתרגמת את סוג הרכב לשם בעברית: רגיל, מנוי או נכה.
   String vehicleTypeText(dynamic value) {
     switch ((value ?? '').toString()) {
+      case 'disabled_regular':
+        return 'נכה רגיל';
       case 'disabled':
-        return 'נכה';
+        return 'נכה'; // הרשומה הישנה אינה מפרטת סוג נכות.
+      case 'disabled_wheelchair':
+      case 'wheelchair':
+        return 'נכה כיסא גלגלים';
       case 'subscriber':
         return 'מנוי';
       case 'regular':
@@ -1147,10 +1180,9 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
                           Text('שישי–שבת: ₪${asDouble(p['weekend_daily_price']).toStringAsFixed(2)} ליום'),
                         if (price <= 0 && asDouble(p['student_daily_price']) > 0)
                           Text('לסטודנט מאומת: ₪${asDouble(p['student_daily_price']).toStringAsFixed(2)} ליום'),
-                        Text(
-                          'יציאת נכה ללא תשלום: '
-                          '${p['disabled_exit_allowed'] == true ? 'מאושר' : 'לא מאושר'}',
-                        ),
+                        // מציג פטור נפרד לכל אחד משני סוגי הנכים.
+                        Text('נכה רגיל: ${disabledExemptForLot(p, 'disabled_regular') ? 'פטור מתשלום' : 'משלם לפי התעריף'}'),
+                        Text('נכה עם כיסא גלגלים: ${disabledExemptForLot(p, 'disabled_wheelchair') ? 'פטור מתשלום' : 'משלם לפי התעריף'}'),
                       ],
                     ),
                   ),
@@ -1271,7 +1303,7 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '${s['plate'] ?? '-'}  •  ${customerName(s)}',
+                      '${formatPlateForDb((s['plate'] ?? '-').toString())}  •  ${customerName(s)}',
                       style: const TextStyle(
                         color: blue,
                         fontSize: 17,
@@ -1313,7 +1345,9 @@ class _CarSimulatorScreenState extends State<CarSimulatorScreen> {
               _detail('כניסה', formatDateTime(s['entry_time'])),
               _detail('יציאה', formatDateTime(s['exit_time'])),
               _detail('שולם בתאריך', formatDateTime(s['paid_at'])),
-              _detail('סוג רכב', s['is_student'] == true ? 'סטודנט מאומת' : vehicleTypeText(s['vehicle_type'])),
+              _detail('סוג רכב', (s['vehicle_type'] == 'student' ||
+                  (s['is_student'] == true && (s['vehicle_type'] == 'regular' || s['vehicle_type'] == null)))
+                  ? 'סטודנט מאומת' : vehicleTypeText(s['vehicle_type'])),
               if (ppm > 0) _detail('מחיר לדקה', '₪${ppm.toStringAsFixed(2)}'),
               _detail('זמן חסד', '$grace דקות'),
               _detail(ppm <= 0 ? 'מחיר יומי' : 'תקרה יומית', '₪${dailyMax.toStringAsFixed(2)}'),
@@ -1389,4 +1423,7 @@ class _StatData {
   final IconData icon;
   const _StatData(this.title, this.value, this.icon);
 }
+
+
+
 
